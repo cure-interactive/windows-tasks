@@ -12,6 +12,8 @@ Notes
 Buttons
 - "Clear Icon Cache (Win11)": Kills explorer.exe, deletes iconcache*/thumbcache*,
   then restarts Explorer.
+- "Uninstall ALL pip Packages": Uninstalls every package shown by `pip list`
+  for the currently-running Python interpreter.
 
 Requires
 - customtkinter
@@ -28,6 +30,7 @@ import sys
 import time
 import ctypes
 import subprocess
+import threading
 from dataclasses import dataclass
 
 import customtkinter as ctk
@@ -256,6 +259,83 @@ def clear_windows_icon_cache() -> list[str]:
   return logs
 
 
+def build_pip_uninstall_all_cmd(python_exe: str) -> str:
+  """
+  Build the Windows CMD one-liner to uninstall ALL packages from a Python's pip
+  EXCEPT `pip` itself.
+
+  Notes
+  -----
+  - We intentionally keep `pip` installed so the interpreter can still manage packages.
+
+  Equivalent shape to:
+    for /f "skip=2 tokens=1" %i in ('python -m pip list') do if /i not "%i"=="pip" python -m pip uninstall -y %i
+
+  Parameters
+  ----------
+  python_exe : str
+    Absolute path to the Python executable to use.
+
+  Returns
+  -------
+  str
+    A command string suitable for: ["cmd.exe", "/c", <string>]
+  """
+  py = os.path.abspath(python_exe)
+  pyq = f'"{py}"'
+  return (
+    'for /f "skip=2 tokens=1" %i in (\''
+    f'{pyq} -m pip list'
+    "\') do "
+    f'if /i not "%i"=="pip" {pyq} -m pip uninstall -y %i'
+  )
+
+
+def uninstall_all_pip_packages_windows(timeout_s: int = 3600) -> list[str]:
+  """
+  Uninstall ALL pip packages for the currently-running Python (Windows-only).
+
+  Notes
+  -----
+  - This is destructive and intended for "nuke site-packages" scenarios.
+  - Typically requires Admin if Python lives in Program Files.
+
+  Parameters
+  ----------
+  timeout_s : int
+    Overall timeout for the full uninstall loop (seconds).
+
+  Returns
+  -------
+  list[str]
+    Human-readable log lines of what happened.
+  """
+  if not is_windows():
+    raise RuntimeError("This task is Windows-only.")
+
+  logs: list[str] = []
+  cmd = build_pip_uninstall_all_cmd(sys.executable)
+
+  logs.append("[💥 pip] Uninstall ALL packages (global) requested.")
+  logs.append("[⚠️ DANGER] This will remove *everything* installed via pip for this Python (except `pip`).")
+  logs.append("[🧾 CMD] Running:")
+  logs.append(f"  {cmd}")
+
+  r = run_cmd_capture(["cmd.exe", "/c", cmd], timeout_s=timeout_s)
+  logs.append(f"[💻 CMD] exit={r.code}")
+
+  if r.out.strip():
+    logs.append("[📤 stdout]")
+    logs += [f"  {line}" for line in r.out.splitlines()]
+
+  if r.err.strip():
+    logs.append("[📥 stderr]")
+    logs += [f"  {line}" for line in r.err.splitlines()]
+
+  logs.append("[✅ Done] pip uninstall loop finished.")
+  return logs
+
+
 # =============================================================================
 # [🪟 GUI]
 # =============================================================================
@@ -311,6 +391,13 @@ class WindowsTasksApp(ctk.CTk):
     )
     self.clear_icon_btn.grid(row=0, column=0, sticky="we", padx=12, pady=12)
 
+    self.uninstall_all_pip_btn = ctk.CTkButton(
+      self.btn_frame,
+      text="Uninstall ALL pip Packages (except pip) (Global)  •  DANGEROUS",
+      command=self.on_uninstall_all_pip_packages
+    )
+    self.uninstall_all_pip_btn.grid(row=1, column=0, sticky="we", padx=12, pady=(0, 12))
+
     # Output log
     self.log_box = ctk.CTkTextbox(self, wrap="word")
     self.log_box.grid(row=3, column=0, sticky="nsew", padx=18, pady=(0, 18))
@@ -323,13 +410,36 @@ class WindowsTasksApp(ctk.CTk):
   def _apply_platform_state(self) -> None:
     if not is_windows():
       self.clear_icon_btn.configure(state="disabled")
-      self.append_log("[⚠️ Platform] Non-Windows detected. Icon cache task disabled.\n")
+      self.uninstall_all_pip_btn.configure(state="disabled")
+      self.append_log("[⚠️ Platform] Non-Windows detected. Windows-only tasks disabled.\n")
 
   def append_log(self, text: str) -> None:
     self.log_box.configure(state="normal")
     self.log_box.insert("end", text)
     self.log_box.see("end")
     self.log_box.configure(state="disabled")
+
+  def append_log_threadsafe(self, text: str) -> None:
+    """Append to the log box from any thread."""
+    self.after(0, lambda: self.append_log(text))
+
+  def _run_task_in_thread(self, name: str, fn, on_finally=None) -> None:
+    """Run a blocking task in a background thread and marshal UI updates safely."""
+
+    def _worker() -> None:
+      try:
+        logs = fn()
+        for line in logs:
+          self.append_log_threadsafe(line + "\n")
+      except Exception as e:
+        self.append_log_threadsafe(f"[❌ Error] {name}: {e}\n")
+      finally:
+        self.append_log_threadsafe("\n")
+        if on_finally:
+          self.after(0, on_finally)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
 
   def on_clear_icon_cache(self) -> None:
     if not is_windows():
@@ -360,6 +470,31 @@ class WindowsTasksApp(ctk.CTk):
     finally:
       self.append_log("\n")
       self.clear_icon_btn.configure(state="normal")
+
+  def on_uninstall_all_pip_packages(self) -> None:
+    if not is_windows():
+      self.append_log("[❌ Task] This task is Windows-only.\n")
+      return
+
+    # Ensure admin for Program Files installs.
+    if not is_admin_windows():
+      self.append_log("[🛡️ UAC] Admin required. Requesting elevation...\n")
+      try:
+        relaunch_as_admin_windows()
+      except SystemExit:
+        return
+      except Exception as e:
+        self.append_log(f"[❌ UAC] Elevation failed: {e}\n")
+        return
+
+    self.uninstall_all_pip_btn.configure(state="disabled")
+    self.append_log("[💥 Task] Uninstalling ALL pip packages for this Python...\n")
+
+    self._run_task_in_thread(
+      name="pip uninstall all",
+      fn=lambda: uninstall_all_pip_packages_windows(timeout_s=3600),
+      on_finally=lambda: self.uninstall_all_pip_btn.configure(state="normal"),
+    )
 
 
 def main() -> None:

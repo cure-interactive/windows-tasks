@@ -1,0 +1,9 @@
+# =============================================================================
+# Windows Tasks - Cure Interactive
+# =============================================================================
+# Notes:
+# - This script requires Python 3.10+ (uses PEP 604 union types: `list[str] | None`).
+# - Windows-only behavior is handled via stdlib (ctypes/subprocess/etc).
+# =============================================================================
+
+customtkinter>=5.2.0
